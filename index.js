@@ -2,10 +2,13 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const {
   readEmailData,
-  addSender,
-  addReceiver,
-  sendEmail,
   saveEmailData,
+  addGmailSender,
+  addBrevoAccount,
+  addBrevoFromEmail,
+  addReceiver,
+  getAllSenders,
+  sendEmail,
 } = require("./email");
 
 const fs = require("fs");
@@ -296,13 +299,95 @@ bot.on("callback_query", async (query) => {
 
   // Tambah pengirim
   if (data === "add_sender") {
-    chatState[chatId] = { flow: "email", step: "add_sender_email", userId: currentUserId };
+    chatState[chatId] = { flow: "email", step: "add_sender_type", userId: currentUserId };
     return safeEdit(
       chatId,
       messageId,
-      "Kirim *email pengirim* (Gmail):",
+      "Pilih *tipe pengirim*:",
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "📧 Gmail SMTP", callback_data: "sender_type_gmail" },
+              { text: "📨 Brevo SMTP", callback_data: "sender_type_brevo" },
+            ],
+            [BACK_BUTTON],
+          ],
+        },
+      }
+    );
+  }
+
+  if (data === "sender_type_gmail") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "add_sender_type") return;
+    state.senderType = "gmail";
+    state.step = "add_sender_email";
+    return safeEdit(
+      chatId,
+      messageId,
+      "Masukkan *email Gmail* pengirim:",
       { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
     );
+  }
+
+  if (data === "sender_type_brevo") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "add_sender_type") return;
+    state.senderType = "brevo";
+
+    // Cek apakah sudah ada akun Brevo tersimpan
+    const emailData = readEmailData(currentUserId);
+    const brevoAccounts = emailData.brevoAccounts || [];
+
+    if (brevoAccounts.length > 0) {
+      // Tampilkan pilihan: pakai akun existing atau tambah baru
+      const accountButtons = brevoAccounts.map((acc, i) => [
+        { text: `📨 ${acc.brevoEmail} (${acc.fromEmails.length} from)`, callback_data: `brevo_pick_acc_${i}` }
+      ]);
+      accountButtons.push([{ text: "➕ Tambah akun Brevo baru", callback_data: "brevo_new_acc" }]);
+      accountButtons.push([BACK_BUTTON]);
+      state.step = "brevo_pick_or_new";
+      return safeEdit(chatId, messageId, "Pilih *akun Brevo* yang mau dipakai, atau tambah baru:", {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: accountButtons },
+      });
+    }
+
+    // Belum ada akun Brevo, langsung ke input baru
+    state.step = "add_sender_brevo_email";
+    return safeEdit(chatId, messageId, "Masukkan *email akun Brevo* kamu (untuk login SMTP):", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+    });
+  }
+
+  // Pilih akun Brevo existing
+  if (data.startsWith("brevo_pick_acc_")) {
+    const state = chatState[chatId];
+    if (!state) return;
+    const idx = parseInt(data.split("_")[3], 10);
+    const emailData = readEmailData(currentUserId);
+    const acc = (emailData.brevoAccounts || [])[idx];
+    if (!acc) return safeEdit(chatId, messageId, "❌ Akun tidak ditemukan.", { reply_markup: { inline_keyboard: [[BACK_BUTTON]] } });
+    state.brevoEmail = acc.brevoEmail;
+    state.step = "add_sender_brevo_from";
+    return safeEdit(chatId, messageId,
+      `Akun: \`${acc.brevoEmail}\`\n\nMasukkan *email pengirim (from)* yang sudah diverifikasi di Brevo:`,
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
+    );
+  }
+
+  // Tambah akun Brevo baru
+  if (data === "brevo_new_acc") {
+    const state = chatState[chatId];
+    if (!state) return;
+    state.step = "add_sender_brevo_email";
+    return safeEdit(chatId, messageId, "Masukkan *email akun Brevo* kamu (untuk login SMTP):", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+    });
   }
 
   // Tambah penerima
@@ -403,16 +488,34 @@ bot.on("callback_query", async (query) => {
     const emailData = readEmailData(currentUserId);
     let text = "📋 *Daftar Pengirim & Penerima*\n\n";
 
-    text += "*Pengirim:*\n";
-    if (emailData.senders.length) {
-      emailData.senders.forEach((s, i) => text += `${i + 1}. \`${s.email}\`\n`);
+    // Gmail senders
+    text += "*📧 Gmail:*\n";
+    const gmailSenders = emailData.senders.filter(s => s.type === "gmail");
+    if (gmailSenders.length) {
+      gmailSenders.forEach((s, i) => { text += `${i + 1}. \`${s.email}\`\n`; });
+    } else {
+      text += "_Belum ada_\n";
+    }
+
+    // Brevo accounts
+    text += "\n*📨 Brevo:*\n";
+    const brevoAccounts = emailData.brevoAccounts || [];
+    if (brevoAccounts.length) {
+      brevoAccounts.forEach((acc) => {
+        text += `• Login: \`${acc.brevoEmail}\`\n`;
+        if (acc.fromEmails.length) {
+          acc.fromEmails.forEach((f, j) => { text += `  ${j + 1}. \`${f}\`\n`; });
+        } else {
+          text += "  _Belum ada from email_\n";
+        }
+      });
     } else {
       text += "_Belum ada_\n";
     }
 
     text += "\n*Penerima:*\n";
     if (emailData.receivers.length) {
-      emailData.receivers.forEach((email, i) => text += `${i + 1}. \`${email}\`\n`);
+      emailData.receivers.forEach((email, i) => { text += `${i + 1}. \`${email}\`\n`; });
     } else {
       text += "_Belum ada_\n";
     }
@@ -426,7 +529,8 @@ bot.on("callback_query", async (query) => {
   // Send email
   if (data === "send_email") {
     const emailData = readEmailData(currentUserId);
-    if (!emailData.senders.length || !emailData.receivers.length) {
+    const allSenders = getAllSenders(currentUserId);
+    if (!allSenders.length || !emailData.receivers.length) {
       return safeEdit(
         chatId,
         messageId,
@@ -463,13 +567,15 @@ bot.on("message", async (msg) => {
 
   try {
     // ---------- Add Pengirim ----------
+
+    // Gmail: email → appPassword
     if (state.step === "add_sender_email") {
       if (!isValidEmail(text)) {
         return bot.sendMessage(chatId, "❌ Format email tidak valid. Masukkan email yang benar (contoh: user@gmail.com).");
       }
       state.senderEmail = text;
       state.step = "add_sender_password";
-      return bot.sendMessage(chatId, "Masukkan *App Password* (16 digit):", {
+      return bot.sendMessage(chatId, "Masukkan *App Password* Gmail (16 digit):", {
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
       });
@@ -479,9 +585,48 @@ bot.on("message", async (msg) => {
       if (text.length < 8) {
         return bot.sendMessage(chatId, "❌ Password terlalu pendek (minimal 8 karakter).");
       }
-      const success = addSender(state.userId, state.senderEmail, text);
+      const success = addGmailSender(state.userId, state.senderEmail, text);
       delete chatState[chatId];
-      return bot.sendMessage(chatId, success ? "✅ Pengirim berhasil ditambahkan." : "⚠️ Email sudah terdaftar.");
+      return bot.sendMessage(chatId, success ? "✅ Pengirim Gmail berhasil ditambahkan." : "⚠️ Email sudah terdaftar.");
+    }
+
+    // Brevo: brevoEmail → apiKey → fromEmail (akun baru)
+    if (state.step === "add_sender_brevo_email") {
+      if (!isValidEmail(text)) {
+        return bot.sendMessage(chatId, "❌ Format email tidak valid.");
+      }
+      state.brevoEmail = text;
+      state.step = "add_sender_brevo_apikey";
+      return bot.sendMessage(chatId, "Masukkan *SMTP API Key* Brevo kamu:\n\n_(Brevo → SMTP & API → SMTP → Generate a new SMTP key)_", {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+      });
+    }
+
+    if (state.step === "add_sender_brevo_apikey") {
+      if (text.length < 8) {
+        return bot.sendMessage(chatId, "❌ API Key terlalu pendek.");
+      }
+      state.apiKey = text;
+      // Simpan akun Brevo dulu, lalu minta fromEmail
+      addBrevoAccount(state.userId, state.brevoEmail, state.apiKey);
+      state.step = "add_sender_brevo_from";
+      return bot.sendMessage(chatId, "Akun Brevo disimpan! ✅\n\nSekarang masukkan *email pengirim (from)* yang sudah diverifikasi di Brevo:", {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+      });
+    }
+
+    // fromEmail — dipakai baik dari akun existing maupun akun baru
+    if (state.step === "add_sender_brevo_from") {
+      if (!isValidEmail(text)) {
+        return bot.sendMessage(chatId, "❌ Format email tidak valid.");
+      }
+      const result = addBrevoFromEmail(state.userId, state.brevoEmail, text);
+      delete chatState[chatId];
+      if (result === "ok") return bot.sendMessage(chatId, `✅ Email pengirim \`${text}\` berhasil ditambahkan ke akun Brevo.`, { parse_mode: "Markdown" });
+      if (result === "duplicate") return bot.sendMessage(chatId, "⚠️ Email pengirim sudah terdaftar di akun ini.");
+      return bot.sendMessage(chatId, "❌ Akun Brevo tidak ditemukan.");
     }
 
     // ---------- Add Penerima ----------
@@ -523,7 +668,8 @@ bot.on("message", async (msg) => {
       }
 
       const emailData = readEmailData(state.userId);
-      const { senders, receivers } = emailData;
+      const senders = getAllSenders(state.userId);
+      const { receivers } = emailData;
       delete chatState[chatId];
 
       const statusMsg = await bot.sendMessage(chatId, "⏳ Sedang mengirim email...\nSabar ya kakak agak lama 🤗");
