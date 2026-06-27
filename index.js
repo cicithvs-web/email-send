@@ -13,6 +13,8 @@ const {
 
 const fs = require("fs");
 const path = require("path");
+const inbox = require("./inbox");
+const { replyMeta } = inbox;
 
 // ==================== Konfigurasi ====================
 const BOT_TOKEN = process.env.EMAIL_BOT_TOKEN;
@@ -25,8 +27,34 @@ if (!BOT_TOKEN || !OWNER_ID) {
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const chatState = {};
+inbox.init(bot);
+inbox.loadAllAndStart();
 
 const BACK_BUTTON = { text: "⬅️", callback_data: "back_to_menu" };
+
+// ==================== Helper: Sender Picker ====================
+function buildPickSendersMessage(allSenders, selectedIdxs) {
+  const senderRows = allSenders.map((s, i) => {
+    const checked = selectedIdxs.includes(i) ? "✅" : "⬜";
+    const label = s.email.length > 28 ? s.email.slice(0, 25) + "…" : s.email;
+    return [{ text: `${checked} ${label}`, callback_data: `toggle_sender_${i}` }];
+  });
+
+  const allSelected = selectedIdxs.length === allSenders.length;
+  senderRows.push([
+    { text: allSelected ? "✅ Semua Dipilih" : "☑️ Pilih Semua", callback_data: "toggle_all_senders" },
+  ]);
+  senderRows.push([
+    { text: `📨 Lanjut (${selectedIdxs.length} dipilih)`, callback_data: "confirm_senders" },
+  ]);
+  senderRows.push([BACK_BUTTON]);
+
+  const text =
+    `📤 *Pilih Email Pengirim*\n\nCentang pengirim yang ingin digunakan:\n` +
+    `_(${selectedIdxs.length} dari ${allSenders.length} dipilih)_`;
+
+  return [text, { parse_mode: "Markdown", reply_markup: { inline_keyboard: senderRows } }];
+}
 const USERS_FILE = path.join(__dirname, "users.json");
 const MAX_SEND_COUNT = 500; // batas maksimal jumlah kirim per sesi
 
@@ -35,7 +63,6 @@ function safeEdit(chatId, messageId, text, extra = {}) {
   return bot
     .editMessageText(text, { chat_id: chatId, message_id: messageId, ...extra })
     .catch((err) => {
-      // Abaikan error jika pesan sudah tidak ada
       if (err.code === 400) return;
       console.error("Gagal edit pesan:", err.message);
     });
@@ -117,6 +144,7 @@ function showMainMenu(chatId, messageId = null) {
       ],
       [{ text: "📋 List Pengirim & Penerima", callback_data: "list_all" }],
       [{ text: "📨 Send Email", callback_data: "send_email" }],
+      [{ text: "📬 Inbox (Email Masuk)", callback_data: "inbox_menu" }],
     ],
   };
 
@@ -526,7 +554,59 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // Send email
+  // ========== Inbox Menu ==========
+  if (data === "inbox_menu") {
+    const cfg = inbox.getImapConfig(currentUserId);
+    const active = inbox.isActive(currentUserId);
+    const status = active ? "🟢 Aktif" : "🔴 Mati";
+    const cfgInfo = cfg ? `\nAkun: \`${cfg.user}\`` : "\n_Belum dikonfigurasi_";
+    return safeEdit(chatId, messageId,
+      `📬 *Inbox Email Masuk*\n\nStatus: ${status}${cfgInfo}\n\nEmail masuk akan diteruskan ke sini. Balas pesan notifikasinya untuk membalas email langsung dari Telegram.`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "⚙️ Setup IMAP", callback_data: "inbox_setup" }],
+    [active
+? { text: "🔌 Disconnect",
+   callback_data: "inbox_stop" }
+: { text: "🔌 Connect", callback_data: "inbox_start" }
+            ],
+            [BACK_BUTTON],
+          ],
+        },
+      }
+    );
+  }
+
+  if (data === "inbox_setup") {
+    chatState[chatId] = { flow: "inbox", step: "imap_host", userId: currentUserId };
+    return safeEdit(chatId, messageId,
+      "⚙️ *Setup IMAP*\n\nMasukkan *IMAP host*:\n_Contoh Gmail: imap.gmail.com_\n_Contoh Outlook: outlook.office365.com_",
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
+    );
+  }
+
+  if (data === "inbox_start") {
+    if (!inbox.getImapConfig(currentUserId)) {
+      return safeEdit(chatId, messageId, "❌ Belum ada konfigurasi IMAP. Setup dulu.", {
+        reply_markup: { inline_keyboard: [[{ text: "⚙️ Setup IMAP", callback_data: "inbox_setup" }], [BACK_BUTTON]] },
+      });
+    }
+    inbox.startPolling(currentUserId);
+    return safeEdit(chatId, messageId, "✅ Inbox *connect*. Email masuk akan diteruskan ke sini.",
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
+    );
+  }
+
+  if (data === "inbox_stop") {
+    inbox.stopPolling(currentUserId);
+    return safeEdit(chatId, messageId, "⏹ Inbox *disconnect*.",
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
+    );
+  }
+
+  // Send email — step 1: pilih pengirim
   if (data === "send_email") {
     const emailData = readEmailData(currentUserId);
     const allSenders = getAllSenders(currentUserId);
@@ -538,13 +618,56 @@ bot.on("callback_query", async (query) => {
         { reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
       );
     }
-    chatState[chatId] = { flow: "email", step: "send_subject", userId: currentUserId };
-    return safeEdit(
-      chatId,
-      messageId,
-      "Masukkan *Subjek / Judul* email:",
-      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[BACK_BUTTON]] } }
-    );
+    // Init state dengan semua pengirim tercentang
+    chatState[chatId] = {
+      flow: "email",
+      step: "pick_senders",
+      userId: currentUserId,
+      selectedSenders: allSenders.map((_, i) => i), // semua dipilih by default
+    };
+    return safeEdit(chatId, messageId, ...buildPickSendersMessage(allSenders, allSenders.map((_, i) => i)));
+  }
+
+  // Toggle pilihan pengirim
+  if (data.startsWith("toggle_sender_")) {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_senders") return;
+    const idx = parseInt(data.split("_")[2], 10);
+    const allSenders = getAllSenders(state.userId);
+    const sel = state.selectedSenders;
+    if (sel.includes(idx)) {
+      state.selectedSenders = sel.filter((i) => i !== idx);
+    } else {
+      state.selectedSenders = [...sel, idx].sort((a, b) => a - b);
+    }
+    return safeEdit(chatId, messageId, ...buildPickSendersMessage(allSenders, state.selectedSenders));
+  }
+
+  // Toggle semua pengirim
+  if (data === "toggle_all_senders") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_senders") return;
+    const allSenders = getAllSenders(state.userId);
+    if (state.selectedSenders.length === allSenders.length) {
+      state.selectedSenders = [];
+    } else {
+      state.selectedSenders = allSenders.map((_, i) => i);
+    }
+    return safeEdit(chatId, messageId, ...buildPickSendersMessage(allSenders, state.selectedSenders));
+  }
+
+  // Konfirmasi pilihan pengirim → lanjut ke subjek
+  if (data === "confirm_senders") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_senders") return;
+    if (!state.selectedSenders.length) {
+      return bot.answerCallbackQuery(query.id, { text: "⚠️ Pilih minimal 1 pengirim!", show_alert: true });
+    }
+    state.step = "send_subject";
+    return safeEdit(chatId, messageId, "Masukkan *Subjek / Judul* email:", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+    });
   }
 });
 
@@ -554,6 +677,50 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
   if (msg.text && msg.text.startsWith("/")) return;
+
+  // ========== Reply ke email masuk ==========
+  // Deteksi saat user reply ke pesan notifikasi "↩️ Balas pesan ini..."
+  if (
+    msg.reply_to_message &&
+    msg.reply_to_message.text &&
+    msg.reply_to_message.text.startsWith("↩️ Balas pesan ini untuk membalas email ke")
+  ) {
+    const repliedMsgId = msg.reply_to_message.message_id;
+
+    // Ambil metadata dari Map (disimpan waktu email masuk)
+    const meta = replyMeta.get(repliedMsgId);
+    let toEmail, replySubject, replyMsgId;
+
+    if (meta) {
+      toEmail = meta.to;
+      replySubject = meta.subject ? (meta.subject.startsWith("Re:") ? meta.subject : `Re: ${meta.subject}`) : "Re:";
+      replyMsgId = meta.msgId || null;
+      replyMeta.delete(repliedMsgId); // bersihkan setelah dipakai
+    } else {
+      // Fallback: ekstrak email dari teks pesan kalau metadata tidak ada (misal setelah restart)
+      const match = msg.reply_to_message.text.match(/ke\s+([^\s@]+@[^\s@]+\.[^\s]+)/);
+      if (!match) return bot.sendMessage(chatId, "❌ Tidak bisa membaca alamat email tujuan dari pesan itu.");
+      toEmail = match[1];
+      replySubject = "Re:";
+      replyMsgId = null;
+    }
+
+    const replyBody = msg.text.trim();
+
+    const allSenders = getAllSenders(userId);
+    if (!allSenders.length) {
+      return bot.sendMessage(chatId, "❌ Belum ada pengirim terdaftar. Tambahkan dulu via menu.");
+    }
+    const sender = allSenders.find(s => s.type === "brevo") || allSenders[0];
+
+    try {
+      await sendEmail(sender, toEmail, replySubject, replyBody, replyMsgId);
+      return bot.sendMessage(chatId, `✅ Balasan terkirim ke \`${toEmail}\``, { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("❌ Gagal kirim balasan:", err.message);
+      return bot.sendMessage(chatId, `❌ Gagal kirim: ${err.message}`);
+    }
+  }
 
   const state = chatState[chatId];
   if (!state) return;
@@ -658,6 +825,47 @@ bot.on("message", async (msg) => {
       });
     }
 
+    // ========== Setup IMAP ==========
+    if (state.flow === "inbox") {
+      if (state.step === "imap_host") {
+        state.imapHost = text;
+        state.step = "imap_user";
+        return bot.sendMessage(chatId, "Masukkan *email akun IMAP* (email yang diteruskan Cloudflare):", {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+        });
+      }
+
+      if (state.step === "imap_user") {
+        if (!isValidEmail(text)) return bot.sendMessage(chatId, "❌ Format email tidak valid.");
+        state.imapUser = text;
+        state.step = "imap_password";
+        return bot.sendMessage(chatId, "Masukkan *App Password* akun tersebut:", {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [[BACK_BUTTON]] },
+        });
+      }
+
+      if (state.step === "imap_password") {
+        if (text.length < 8) return bot.sendMessage(chatId, "❌ Password terlalu pendek.");
+        const isGmail = state.imapHost.includes("gmail");
+        const cfg = {
+          host: state.imapHost,
+          port: isGmail ? 993 : 993,
+          tls: true,
+          user: state.imapUser,
+          password: text,
+        };
+        inbox.setImapConfig(state.userId, cfg); // simpan per user (ke users/{userId}/imap_config.json)
+        inbox.startPolling(state.userId);
+        delete chatState[chatId];
+        return bot.sendMessage(chatId,
+          `✅ IMAP dikonfigurasi!\n\n📬 Polling aktif — email masuk ke \`${cfg.user}\` akan diteruskan ke sini.\n\nBalas pesan notifikasi email untuk membalas langsung.`,
+          { parse_mode: "Markdown" }
+        );
+      }
+    }
+
     if (state.step === "send_count") {
       const count = parseInt(text, 10);
       if (isNaN(count) || count < 1) {
@@ -668,7 +876,11 @@ bot.on("message", async (msg) => {
       }
 
       const emailData = readEmailData(state.userId);
-      const senders = getAllSenders(state.userId);
+      const allSenders = getAllSenders(state.userId);
+      // Hanya pakai pengirim yang dipilih user
+      const senders = (state.selectedSenders && state.selectedSenders.length)
+        ? state.selectedSenders.map((i) => allSenders[i]).filter(Boolean)
+        : allSenders;
       const { receivers } = emailData;
       delete chatState[chatId];
 
