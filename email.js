@@ -70,6 +70,9 @@ function addReceiver(userId, email) {
   return true;
 }
 
+// Kembalikan semua "sender" dalam format flat untuk keperluan kirim & list
+// Gmail: { type, email, appPassword }
+// Brevo: { type, brevoEmail, apiKey, fromEmail } — 1 entry per fromEmail
 function getAllSenders(userId) {
   const data = readEmailData(userId);
   const result = [];
@@ -93,7 +96,7 @@ function getAllSenders(userId) {
   return result;
 }
 
-async function sendEmail(sender, to, subject, text) {
+async function sendEmail(sender, to, subject, text, inReplyToMsgId = null) {
   let transportConfig;
 
   if (sender.type === "brevo") {
@@ -121,7 +124,15 @@ async function sendEmail(sender, to, subject, text) {
   const transporter = nodemailer.createTransport(transportConfig);
   const fromAddress = sender.type === "brevo" ? sender.fromEmail : sender.email;
 
-  return transporter.sendMail({ from: fromAddress, to, subject, text });
+  const mailOptions = { from: fromAddress, to, subject, text };
+
+  // Kalau ini balasan, tambah header reply supaya masuk thread yang sama
+  if (inReplyToMsgId) {
+    mailOptions["In-Reply-To"] = inReplyToMsgId;
+    mailOptions["References"] = inReplyToMsgId;
+  }
+
+  return transporter.sendMail(mailOptions);
 }
 
 module.exports = {
