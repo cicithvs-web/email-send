@@ -28,7 +28,7 @@ if (!BOT_TOKEN || !OWNER_ID) {
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const chatState = {};
 inbox.init(bot);
-inbox.loadAllAndStart();
+inbox.loadAllAndStart(); // auto-start per-user polling dari file tersimpan
 
 const BACK_BUTTON = { text: "⬅️", callback_data: "back_to_menu" };
 
@@ -55,6 +55,30 @@ function buildPickSendersMessage(allSenders, selectedIdxs) {
 
   return [text, { parse_mode: "Markdown", reply_markup: { inline_keyboard: senderRows } }];
 }
+// ==================== Helper: Receiver Picker ====================
+function buildPickReceiversMessage(allReceivers, selectedIdxs) {
+  const receiverRows = allReceivers.map((email, i) => {
+    const checked = selectedIdxs.includes(i) ? "✅" : "⬜";
+    const label = email.length > 28 ? email.slice(0, 25) + "…" : email;
+    return [{ text: `${checked} ${label}`, callback_data: `toggle_receiver_${i}` }];
+  });
+
+  const allSelected = selectedIdxs.length === allReceivers.length;
+  receiverRows.push([
+    { text: allSelected ? "✅ Semua Dipilih" : "☑️ Pilih Semua", callback_data: "toggle_all_receivers" },
+  ]);
+  receiverRows.push([
+    { text: `📩 Lanjut (${selectedIdxs.length} dipilih)`, callback_data: "confirm_receivers" },
+  ]);
+  receiverRows.push([BACK_BUTTON]);
+
+  const text =
+    `📥 *Pilih Email Penerima*\n\nCentang penerima yang ingin dikirimi:\n` +
+    `_(${selectedIdxs.length} dari ${allReceivers.length} dipilih)_`;
+
+  return [text, { parse_mode: "Markdown", reply_markup: { inline_keyboard: receiverRows } }];
+}
+
 const USERS_FILE = path.join(__dirname, "users.json");
 const MAX_SEND_COUNT = 500; // batas maksimal jumlah kirim per sesi
 
@@ -63,6 +87,7 @@ function safeEdit(chatId, messageId, text, extra = {}) {
   return bot
     .editMessageText(text, { chat_id: chatId, message_id: messageId, ...extra })
     .catch((err) => {
+      // Abaikan error jika pesan sudah tidak ada
       if (err.code === 400) return;
       console.error("Gagal edit pesan:", err.message);
     });
@@ -656,12 +681,56 @@ bot.on("callback_query", async (query) => {
     return safeEdit(chatId, messageId, ...buildPickSendersMessage(allSenders, state.selectedSenders));
   }
 
-  // Konfirmasi pilihan pengirim → lanjut ke subjek
+  // Konfirmasi pilihan pengirim → lanjut ke pick_receivers
   if (data === "confirm_senders") {
     const state = chatState[chatId];
     if (!state || state.step !== "pick_senders") return;
     if (!state.selectedSenders.length) {
       return bot.answerCallbackQuery(query.id, { text: "⚠️ Pilih minimal 1 pengirim!", show_alert: true });
+    }
+    const emailData = readEmailData(state.userId);
+    const allReceivers = emailData.receivers;
+    state.step = "pick_receivers";
+    state.selectedReceivers = allReceivers.map((_, i) => i); // semua dipilih by default
+    return safeEdit(chatId, messageId, ...buildPickReceiversMessage(allReceivers, state.selectedReceivers));
+  }
+
+  // Toggle pilihan penerima
+  if (data.startsWith("toggle_receiver_")) {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_receivers") return;
+    const idx = parseInt(data.split("_")[2], 10);
+    const emailData = readEmailData(state.userId);
+    const allReceivers = emailData.receivers;
+    const sel = state.selectedReceivers;
+    if (sel.includes(idx)) {
+      state.selectedReceivers = sel.filter((i) => i !== idx);
+    } else {
+      state.selectedReceivers = [...sel, idx].sort((a, b) => a - b);
+    }
+    return safeEdit(chatId, messageId, ...buildPickReceiversMessage(allReceivers, state.selectedReceivers));
+  }
+
+  // Toggle semua penerima
+  if (data === "toggle_all_receivers") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_receivers") return;
+    const emailData = readEmailData(state.userId);
+    const allReceivers = emailData.receivers;
+    if (state.selectedReceivers.length === allReceivers.length) {
+      state.selectedReceivers = [];
+    } else {
+      state.selectedReceivers = allReceivers.map((_, i) => i);
+    }
+    return safeEdit(chatId, messageId, ...buildPickReceiversMessage(allReceivers, state.selectedReceivers));
+  }
+
+  // Konfirmasi pilihan penerima → lanjut ke subjek
+  if (data === "confirm_receivers") {
+    const state = chatState[chatId];
+    if (!state || state.step !== "pick_receivers") return;
+    if (!state.selectedReceivers.length) {
+      return bot.answerCallbackQuery(query.id, { text: "⚠️ Pilih minimal 1 penerima!", show_alert: true });
     }
     state.step = "send_subject";
     return safeEdit(chatId, messageId, "Masukkan *Subjek / Judul* email:", {
@@ -881,7 +950,11 @@ bot.on("message", async (msg) => {
       const senders = (state.selectedSenders && state.selectedSenders.length)
         ? state.selectedSenders.map((i) => allSenders[i]).filter(Boolean)
         : allSenders;
-      const { receivers } = emailData;
+      // Hanya pakai penerima yang dipilih user
+      const allReceivers = emailData.receivers;
+      const receivers = (state.selectedReceivers && state.selectedReceivers.length)
+        ? state.selectedReceivers.map((i) => allReceivers[i]).filter(Boolean)
+        : allReceivers;
       delete chatState[chatId];
 
       const statusMsg = await bot.sendMessage(chatId, "⏳ Sedang mengirim email...\nSabar ya kakak agak lama 🤗");
