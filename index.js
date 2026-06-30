@@ -13,6 +13,8 @@ const {
 
 const fs = require("fs");
 const path = require("path");
+const archiver = require("archiver");
+const AdmZip = require("adm-zip");
 const inbox = require("./inbox");
 const { replyMeta } = inbox;
 
@@ -289,6 +291,53 @@ bot.onText(/\/approve (.+)/, (msg, match) => {
     parse_mode: "Markdown",
   });
   bot.sendMessage(targetId, "✅ Kamu telah di-approve oleh owner! Silakan gunakan bot dengan /start ulang.").catch(() => {});
+});
+
+// ==================== /backup ====================
+bot.onText(/\/backup/, async (msg) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  if (userId !== OWNER_ID && !isApproved(userId)) return;
+
+  const userDir = path.join(__dirname, "users", String(userId));
+  if (!fs.existsSync(userDir)) {
+    return bot.sendMessage(chatId, "⚠️ Belum ada data yang tersimpan untuk akun kamu.");
+  }
+
+  const tmpDir = path.join(__dirname, "tmp_backup");
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  const zipPath = path.join(tmpDir, `backup_${userId}_${Date.now()}.zip`);
+
+  const statusMsg = await bot.sendMessage(chatId, "⏳ Sedang membuat file backup...");
+
+  try {
+    await new Promise((resolve, reject) => {
+      const output = fs.createWriteStream(zipPath);
+      const archive = archiver("zip", { zlib: { level: 9 } });
+
+      output.on("close", resolve);
+      archive.on("error", reject);
+
+      archive.pipe(output);
+      // Masukkan seluruh folder data user (email.json, imap_config.json, dll) ke dalam zip
+      archive.directory(userDir, false);
+      archive.finalize();
+    });
+
+    await bot.sendDocument(
+      chatId,
+      zipPath,
+      { caption: "✅ Backup berhasil dibuat (sender, receiver, config IMAP).\n\nKirim ulang file ini kapan saja untuk *restore* data kamu.\n⚠️ Restore akan *menimpa total* data yang ada saat itu, bukan menggabungkan." },
+      { filename: `backup_${userId}.zip`, contentType: "application/zip" }
+    );
+  } catch (err) {
+    console.error("❌ Gagal membuat backup:", err.message);
+    bot.sendMessage(chatId, `❌ Gagal membuat backup: ${err.message}`);
+  } finally {
+    fs.unlink(zipPath, () => {});
+    bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+  }
 });
 
 // ==================== Callback Query ====================
@@ -746,6 +795,61 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
   if (msg.text && msg.text.startsWith("/")) return;
+
+  // ========== Restore dari file backup .zip ==========
+  if (msg.document && msg.document.file_name && msg.document.file_name.toLowerCase().endsWith(".zip")) {
+    if (userId !== OWNER_ID && !isApproved(userId)) return;
+
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Sedang memproses restore...");
+    const tmpDir = path.join(__dirname, "tmp_backup");
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const downloadPath = path.join(tmpDir, `restore_${userId}_${Date.now()}.zip`);
+
+    try {
+      const fileLink = await bot.getFileLink(msg.document.file_id);
+      const res = await fetch(fileLink);
+      if (!res.ok) throw new Error("Gagal mengunduh file dari Telegram.");
+      const buffer = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(downloadPath, buffer);
+
+      const zip = new AdmZip(downloadPath);
+      const entries = zip.getEntries();
+
+      // Validasi sederhana: pastikan ada email.json di dalam zip
+      const hasEmailJson = entries.some((e) => e.entryName === "email.json" || e.entryName.endsWith("/email.json"));
+      if (!hasEmailJson) {
+        throw new Error("File ini bukan backup yang valid (email.json tidak ditemukan).");
+      }
+
+      const userDir = path.join(__dirname, "users", String(userId));
+      if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+      zip.extractAllTo(userDir, true); // overwrite = true
+
+      // Reconnect IMAP otomatis pakai config yang baru di-restore (kalau ada)
+      const restoredImapConfigPath = path.join(userDir, "imap_config.json");
+      if (fs.existsSync(restoredImapConfigPath)) {
+        inbox.stopPolling(userId); // hentikan koneksi lama (kalau sedang aktif) biar ga dobel
+        const cfg = JSON.parse(fs.readFileSync(restoredImapConfigPath, "utf8"));
+        inbox.setImapConfig(userId, cfg);
+        inbox.startPolling(userId);
+      }
+
+      await bot.editMessageText(
+        "✅ Restore berhasil! Data kamu sudah dipulihkan (sender, receiver, config IMAP) dan inbox langsung aktif kembali.\n\n" +
+          "⚠️ Catatan: restore ini *menimpa* data lama secara penuh, bukan menggabungkan. Jadi perubahan yang kamu buat setelah backup terakhir akan hilang.",
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      console.error("❌ Gagal restore:", err.message);
+      await bot.editMessageText(`❌ Gagal restore: ${err.message}`, {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+      });
+    } finally {
+      fs.unlink(downloadPath, () => {});
+    }
+    return;
+  }
 
   // ========== Reply ke email masuk ==========
   // Deteksi saat user reply ke pesan notifikasi "↩️ Balas pesan ini..."
