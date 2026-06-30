@@ -93,11 +93,30 @@ function processMessage(imap, uid, userId) {
             const fromRaw = parsed.from?.text || "";
             const fromEmail = extractEmail(fromRaw);
             const subject = parsed.subject || "";
-            const body = parsed.text || parsed.html || "";
+            const htmlBody = parsed.html || "";
+            const body = parsed.text || htmlBody || "";
             const date = parsed.date;
 
             const telegramText = formatIncomingEmail({ from: fromRaw, subject, body, date });
+
             await botInstance.sendMessage(userId, telegramText, { parse_mode: "Markdown" });
+
+            // Kirim file .html kalau ada html body
+            if (htmlBody) {
+              const safeSubject = (subject || "email")
+                .replace(/[^a-zA-Z0-9_\-. ]/g, "")
+                .trim()
+                .replace(/\s+/g, "_")
+                .substring(0, 50);
+              const filename = `${safeSubject || "email"}.html`;
+              const htmlBuffer = Buffer.from(htmlBody, "utf8");
+              await botInstance.sendDocument(userId, htmlBuffer, {
+                caption: "📄 Versi HTML email",
+              }, {
+                filename,
+                contentType: "text/html",
+              });
+            }
 
             const replyPrompt = await botInstance.sendMessage(
               userId,
