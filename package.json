@@ -6,6 +6,8 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.10",
+    "archiver": "^6.0.1",
     "dotenv": "^16.4.5",
     "imap": "^0.8.19",
     "mailparser": "^3.7.1",
