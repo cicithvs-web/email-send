@@ -1061,10 +1061,11 @@ bot.on("message", async (msg) => {
         : allReceivers;
       delete chatState[chatId];
 
-      const statusMsg = await bot.sendMessage(chatId, "⏳ Sedang mengirim email...\nSabar ya kakak agak lama 🤗");
+      const totalEmails = senders.length * receivers.length * count;
+      const statusMsg = await bot.sendMessage(chatId, `⏳ Memulai pengiriman...\n📊 Total: 0 / ${totalEmails}`);
 
-      let success = 0,
-        failed = 0;
+      let success = 0, failed = 0;
+      let lastEditTime = 0;
 
       // Kirim secara berurutan
       for (const sender of senders) {
@@ -1077,8 +1078,22 @@ bot.on("message", async (msg) => {
               console.error(`Gagal kirim ke ${receiver}:`, err.message);
               failed++;
             }
-            // jeda 1.2 detik
-            await new Promise((r) => setTimeout(r, 1200));
+
+            // Update progress tiap 3 detik biar ga kena rate limit Telegram
+            const now = Date.now();
+            if (now - lastEditTime >= 3000) {
+              lastEditTime = now;
+              const done = success + failed;
+              const pct = Math.round((done / totalEmails) * 100);
+              const bar = "█".repeat(Math.floor(pct / 10)) + "░".repeat(10 - Math.floor(pct / 10));
+              bot.editMessageText(
+                `⏳ *Sedang mengirim...*\n\n${bar} ${pct}%\n✅ Berhasil: ${success}\n❌ Gagal: ${failed}\n📨 Total: ${done} / ${totalEmails}`,
+                { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+              ).catch(() => {});
+            }
+
+            // jeda 500ms
+            await new Promise((r) => setTimeout(r, 500));
           }
         }
       }
